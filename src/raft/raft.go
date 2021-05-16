@@ -18,14 +18,23 @@ package raft
 //
 
 import (
-//	"bytes"
+	"math/rand"
+
+	//	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
 
-//	"6.824/labgob"
+	//	"6.824/labgob"
 	"6.824/labrpc"
 )
 
+// 节点状态
+const (
+	StateFollower = iota
+	StateCandidate
+	StateLeader
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -64,16 +73,42 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Persistent state
+	currentTerm int // 节点上的最新任期，初始化为0，单调递增
+	votedFor int // 当前任期投票所给的候选人id，null if none
+	log []Entry // 日志条目列表，first index is 1
+
+	// Volatile state on all servers
+	commitIndex int // 最新的已被提交的日志索引号，初始为0，单调递增
+	lastApplied int // 最新的已被应用到状态机的索引号，初始为0，单调递增
+
+	// Volatile state on leaders
+	nextIndex []int // 保存需要发送给每个节点的下一条日志条目的索引号，初始化为leader的最后一条日志索引 + 1
+	matchIndex []int // 保存所有节点已知的已被复制的最高日志索引号
+
+	//
+	state int
+	voteCount int
+	chHeartBeat chan struct{}
+	chVoteGrant chan struct{}
+	chGetMajorityVote chan struct{}
+}
+
+// 日志条目
+type Entry struct {
+	LogIndex int
+	LogTerm int
+	LogCommand interface{}
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	term := rf.currentTerm
+	isLeader := rf.state == StateLeader
+	rf.mu.Unlock()
+	return term, isLeader
 }
 
 //
@@ -143,6 +178,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -151,13 +190,77 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term int // 领导者的任期号
+	LeaderId int // 领导者在peers中的下标
+	PrevLogIndex int // 本次新增日志的前一个位置日志的索引值
+	PreLogTerm int // 本次新增日志的前一个位置日志的任期号
+	Entries []Entry // 追加到follower上的日志条目
+	LeaderCommit int // 领导者已提交的日志条目的索引值
+}
+
+type AppendEntriesReply struct {
+	Term int // 当前任期
+	Success bool // 当跟随者中的日志情况于leader保持一致时为true，多退少补
 }
 
 //
 // example RequestVote RPC handler.
 //
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.VoteGranted = false
+	if args.Term < rf.currentTerm { // 请求投票携带的任期 小于 接收者的当前任期，则直接返回当前任期通知其过期
+		reply.Term = rf.currentTerm
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = StateFollower
+		rf.votedFor = -1
+	}
+	reply.Term = rf.currentTerm
+	// 判断是否候选人的日志 新于或等于 接收人的日志
+	var isLatest bool
+	latestTerm := rf.log[len(rf.log) - 1].LogTerm
+	latestIndex := rf.log[len(rf.log) - 1].LogIndex
+	if args.LastLogTerm > latestTerm  {
+		isLatest = true
+	}
+	if args.LastLogTerm == latestTerm && args.LastLogIndex >= latestIndex {
+		isLatest = true
+	}
+	// 当voteFor为null或candidateId，并且isLatest为true，则返回进行投票
+	if (rf.votedFor == -1 || args.CandidateId == rf.votedFor) && isLatest {
+		rf.chVoteGrant <- struct{}{}
+		rf.state = StateFollower
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+	}
+}
+
+// AppendEntries RPC handler.
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Success = false
+	if rf.currentTerm > args.Term {
+		reply.Term = rf.currentTerm
+		return
+	}
+	if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.state = StateFollower
+		rf.votedFor = -1
+	}
+	reply.Term = rf.currentTerm
+	rf.chHeartBeat <- struct{}{}
 }
 
 //
@@ -189,11 +292,98 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply) // 利用反射调用Raft.RequestVote
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if ok {
+		if rf.state != StateCandidate {
+			return ok
+		}
+		if rf.currentTerm != args.Term { // 任期变动
+			return ok
+		}
+		// 发起投票接受到的结果中携带的任期大于自己的任期时：
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = StateFollower
+			rf.votedFor = -1
+		}
+		// 候选人获取的选票
+		if reply.VoteGranted {
+			rf.voteCount++
+			if rf.state == StateCandidate && rf.voteCount > len(rf.peers) / 2 {
+				rf.state = StateFollower
+				rf.chGetMajorityVote <- struct{}{}
+			}
+		}
+	}
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if ok {
+		if rf.state != StateLeader {
+			return ok
+		}
+		if rf.currentTerm != args.Term { // 任期变动
+			return ok
+		}
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = StateFollower
+			rf.votedFor = -1
+			return ok
+		}
+		// 根据返回的 success 信息，判断 log 的复制情况
+	}
+
+	return ok
+}
+
+// 发送选举消息到所有其他节点
+func (rf *Raft) broadCastRequestVote() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	args := RequestVoteArgs{
+		Term: rf.currentTerm,
+		CandidateId: rf.me,
+		LastLogTerm: rf.log[len(rf.log) - 1].LogTerm,
+		LastLogIndex: rf.log[len(rf.log) - 1].LogIndex,
+	}
+
+	for index := range rf.peers {
+		if index != rf.me && rf.state == StateCandidate {
+			go func(index int) {
+				var reply RequestVoteReply
+				rf.sendRequestVote(index, args, &reply)
+			}(index)
+		}
+	}
+}
+
+// 发送appendEntries消息到其他所有节点
+func (rf *Raft) broadCastAppendEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	args := AppendEntriesArgs{
+		Term: rf.currentTerm,
+		LeaderId: rf.me,
+		//
+	}
+
+	for index := range rf.peers {
+		if index != rf.me && rf.state == StateLeader {
+			go func(index int) {
+				var reply AppendEntriesReply
+				rf.sendAppendEntries(index, args, &reply)
+			}(index)
+		}
+	}
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -245,11 +435,46 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
+		rf.mu.Lock()
+		state := rf.state
+		rf.mu.Unlock()
 		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
-
+		// be started and to randomize timeout
+		switch state {
+		case StateFollower:
+			// 跟随者：需要对leader 和 candidate 的 RPC 做出反阔
+			// 在超时时间内没有收到leader的心跳信号或者candidate的竞选信号，则将身份变为candidate
+			select {
+			case <-rf.chHeartBeat:
+			case <-rf.chVoteGrant:
+			case <- time.After(time.Duration(rand.Intn(500) + 500) * time.Millisecond):
+				rf.mu.Lock()
+				rf.state = StateCandidate
+				rf.mu.Unlock()
+			}
+		case StateCandidate:
+			// 候选人：增加当前任期，给自己投票，重置竞选超时时间，发送竞选请求到其他节点
+			// 收到大多数投票，则更新身份为leader
+			// 收到更新的领导者的心跳信号，则更新身份为follower
+			// 选举超时则开始新的一轮选举
+			rf.mu.Lock()
+			rf.currentTerm++
+			rf.votedFor = rf.me
+			rf.voteCount = 1
+			rf.mu.Unlock()
+			go rf.broadCastRequestVote()
+			select {
+			case <-time.After(time.Duration(rand.Intn(500) + 500) * time.Millisecond):
+			case <-rf.chHeartBeat:
+				rf.state = StateFollower
+			case <-rf.chGetMajorityVote:
+				rf.state = StateLeader
+			}
+		case StateLeader:
+			// 领导者：重复间隔发送心跳信道到其他节点(不产生分区的情况下，只可能选出一个领导)
+			rf.broadCastAppendEntries()
+			time.Sleep(time.Duration(100) * time.Millisecond)
+		}
 	}
 }
 
@@ -272,6 +497,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.state = StateFollower
+	rf.votedFor = -1
+	rf.log = append(rf.log, Entry{LogTerm: 0})
+	rf.chHeartBeat = make(chan struct{}, 10)
+	rf.chVoteGrant = make(chan struct{}, 10)
+	rf.chGetMajorityVote = make(chan struct{}, 10)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
