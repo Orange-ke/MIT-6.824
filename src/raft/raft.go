@@ -105,9 +105,9 @@ type Entry struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	term := rf.currentTerm
 	isLeader := rf.state == StateLeader
-	rf.mu.Unlock()
 	return term, isLeader
 }
 
@@ -218,12 +218,14 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
 	if args.Term < rf.currentTerm { // 请求投票携带的任期 小于 接收者的当前任期，则直接返回当前任期通知其过期
 		reply.Term = rf.currentTerm
+		_, _ = DPrintf("node: %d, state: %d, get vote request with term < self term", rf.me, rf.state)
 		return
 	}
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = StateFollower
 		rf.votedFor = -1
+		_, _ = DPrintf("node: %d, state: %d, get vote request with term > self term, change to follower", rf.me, rf.state)
 	}
 	reply.Term = rf.currentTerm
 	// 判断是否候选人的日志 新于或等于 接收人的日志
@@ -236,12 +238,30 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	if args.LastLogTerm == latestTerm && args.LastLogIndex >= latestIndex {
 		isLatest = true
 	}
+
+	if rf.votedFor == -1 {
+		_, _ = DPrintf("node: %d, state: %d, hasn't vote for any node", rf.me, rf.state)
+	}
+
+	if rf.votedFor == args.CandidateId {
+		_, _ = DPrintf("node: %d, state: %d, keep vote for %d", rf.me, rf.state, args.CandidateId)
+	} else {
+		_, _ = DPrintf("node: %d, state: %d, already vote for %d", rf.me, rf.state, rf.votedFor)
+	}
+
+	if isLatest {
+		_, _ = DPrintf("node: %d, state: %d, candidate %d log is at least as new as me", rf.me, rf.state, args.CandidateId)
+	} else {
+		_, _ = DPrintf("node: %d, state: %d, candidate %d log is not as new as me", rf.me, rf.state, args.CandidateId)
+	}
+
 	// 当voteFor为null或candidateId，并且isLatest为true，则返回进行投票
 	if (rf.votedFor == -1 || args.CandidateId == rf.votedFor) && isLatest {
 		rf.chVoteGrant <- struct{}{}
 		rf.state = StateFollower
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		_, _ = DPrintf("node: %d, state: %d, grant vote to candidate", rf.me, rf.state)
 	}
 }
 
@@ -258,9 +278,11 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.currentTerm = args.Term
 		rf.state = StateFollower
 		rf.votedFor = -1
+		_, _ = DPrintf("node: %d, state: %d, get heart beat with term > self term, change to follower", rf.me, rf.state)
 	}
 	reply.Term = rf.currentTerm
 	rf.chHeartBeat <- struct{}{}
+	_, _ = DPrintf("node: %d, state: %d, get leader heart beat", rf.me, rf.state)
 }
 
 //
@@ -301,10 +323,12 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 			return ok
 		}
 		if rf.currentTerm != args.Term { // 任期变动
+			_, _ = DPrintf("candidate %d: term change: %d <-> %d", rf.me, rf.currentTerm, args.Term)
 			return ok
 		}
 		// 发起投票接受到的结果中携带的任期大于自己的任期时：
 		if reply.Term > rf.currentTerm {
+			_, _ = DPrintf("candidate: %d vote request get reply term > self term, change to follower", rf.me)
 			rf.currentTerm = reply.Term
 			rf.state = StateFollower
 			rf.votedFor = -1
@@ -312,7 +336,9 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 		// 候选人获取的选票
 		if reply.VoteGranted {
 			rf.voteCount++
+			_, _ = DPrintf("candidate: %d vote request get granted, count: %d", rf.me, rf.voteCount)
 			if rf.state == StateCandidate && rf.voteCount > len(rf.peers) / 2 {
+				_, _ = DPrintf("candidate: %d vote request get most votes", rf.me)
 				rf.state = StateFollower
 				rf.chGetMajorityVote <- struct{}{}
 			}
@@ -330,14 +356,17 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 			return ok
 		}
 		if rf.currentTerm != args.Term { // 任期变动
+			_, _ = DPrintf("leader %d: term change: %d <-> %d", rf.me, rf.currentTerm, args.Term)
 			return ok
 		}
 		if reply.Term > rf.currentTerm {
+			_, _ = DPrintf("leader: %d heart beat get reply term > self term, change to follower", rf.me)
 			rf.currentTerm = reply.Term
 			rf.state = StateFollower
 			rf.votedFor = -1
 			return ok
 		}
+		_, _ = DPrintf("leader: %d heart beat get reply term: %d, self term %d", rf.me, reply.Term, rf.currentTerm)
 		// 根据返回的 success 信息，判断 log 的复制情况
 	}
 
@@ -357,6 +386,7 @@ func (rf *Raft) broadCastRequestVote() {
 
 	for index := range rf.peers {
 		if index != rf.me && rf.state == StateCandidate {
+			_, _ = DPrintf("candidate %d send vote request to node %d", rf.me, index)
 			go func(index int) {
 				var reply RequestVoteReply
 				rf.sendRequestVote(index, args, &reply)
@@ -377,6 +407,8 @@ func (rf *Raft) broadCastAppendEntries() {
 
 	for index := range rf.peers {
 		if index != rf.me && rf.state == StateLeader {
+			// heart beat log
+			_, _ = DPrintf("leader %d send heart beat to node %d", rf.me, index)
 			go func(index int) {
 				var reply AppendEntriesReply
 				rf.sendAppendEntries(index, args, &reply)
@@ -465,13 +497,23 @@ func (rf *Raft) ticker() {
 			go rf.broadCastRequestVote()
 			select {
 			case <-time.After(time.Duration(rand.Intn(500) + 500) * time.Millisecond):
+				rf.mu.Lock()
+				_, _ = DPrintf("candidate %d this term fail to win, init next term", rf.me)
+				rf.mu.Unlock()
 			case <-rf.chHeartBeat:
+				rf.mu.Lock()
 				rf.state = StateFollower
+				_, _ = DPrintf("candidate %d get heart beat, return to follower", rf.me)
+				rf.mu.Unlock()
 			case <-rf.chGetMajorityVote:
+				rf.mu.Lock()
 				rf.state = StateLeader
+				_, _ = DPrintf("candidate %d get most votes", rf.me)
+				rf.mu.Unlock()
 			}
 		case StateLeader:
 			// 领导者：重复间隔发送心跳信道到其他节点(不产生分区的情况下，只可能选出一个领导)
+			_, _ = DPrintf("leader %d send heart beat normally", rf.me)
 			rf.broadCastAppendEntries()
 			time.Sleep(time.Duration(100) * time.Millisecond)
 		}
@@ -495,7 +537,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	_, _ = DPrintf("node: %d init", rf.me)
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = StateFollower
 	rf.votedFor = -1
@@ -505,9 +547,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.chGetMajorityVote = make(chan struct{}, 10)
 
 	// initialize from state persisted before a crash
+	_, _ = DPrintf("node: %d initialize from state persisted before a crash", rf.me)
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
+	_, _ = DPrintf("node: %d start ticker goroutine to start elections", rf.me)
 	go rf.ticker()
 
 
