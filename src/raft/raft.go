@@ -83,6 +83,7 @@ type Raft struct {
 	lastApplied int // 最新的已被应用到状态机的索引号，初始为0，单调递增
 
 	// Volatile state on leaders
+	new        bool  // 是否新上任的leader，新上任的leader在crush之前必须至少提交一条日志，可以提交一个空命令携带当前的term，这样不会出现 raft 论文 图8的情况
 	nextIndex  []int // 保存需要发送给每个节点的下一条日志条目的索引号，初始化为leader的最后一条日志索引 + 1
 	matchIndex []int // 保存所有节点已知的已被复制的最高日志索引号
 
@@ -255,12 +256,6 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		_, _ = DPrintf("node: %d, state: %d, hasn't vote for any node", rf.me, rf.state)
 	}
 
-	if rf.votedFor == args.CandidateId {
-		_, _ = DPrintf("node: %d, state: %d, keep vote for %d", rf.me, rf.state, args.CandidateId)
-	} else {
-		_, _ = DPrintf("node: %d, state: %d, already vote for %d", rf.me, rf.state, rf.votedFor)
-	}
-
 	if isLatest {
 		_, _ = DPrintf("node: %d, state: %d, candidate %d log is at least as new as me", rf.me, rf.state, args.CandidateId)
 	} else {
@@ -303,11 +298,11 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		// 节点在prevLogIndex处不含有日志记录
 		return
 	}
-	rf.log = rf.log[:args.PrevLogIndex + 1] // 当节点 index >= leader保存的index时，这行代码之后index会保持一致
+	rf.log = rf.log[:args.PrevLogIndex+1] // 当节点 index >= leader保存的index时，这行代码之后index会保持一致
 	_, _ = DPrintf("node: %d, args.PrevLogIndex: %d - rf.GetLastIndex(): %d", rf.me, args.PrevLogIndex, rf.GetLastIndex())
 	_, _ = DPrintf("node: %d, args.PreLogTerm: %d - rf.GetLastTerm(): %d", rf.me, args.PreLogTerm, rf.GetLastTerm())
 	if args.PreLogTerm != rf.GetLastTerm() { // 增加该代码，去掉index相同，term不同的log条目 ！！！
-		rf.log = rf.log[:len(rf.log) - 1]
+		rf.log = rf.log[:len(rf.log)-1]
 		return // 这里需要return，让prevIndex - 1， 后面优化
 	}
 	rf.log = append(rf.log, args.Entries...)
@@ -449,6 +444,8 @@ func (rf *Raft) broadCastAppendEntries() {
 	// 判断逻辑为：
 	// 1. 从上一次的commit index + 1 到 last index为止，那些log是大多数node已经复制了的
 	// 2. 找到已经可以commit的日志则通知进行commit
+	// 3. 只要对应的index已经认为可以committed，其之前的index也间接的认为是committed
+	// 4. 通过apply，从记录的applied 到 committed index 都会应用对应的command
 	newCommitIndex := rf.commitIndex
 	lastIndex := rf.GetLastIndex()
 	baseIndex := rf.GetBaseIndex()
@@ -467,6 +464,11 @@ func (rf *Raft) broadCastAppendEntries() {
 	if newCommitIndex != rf.commitIndex {
 		_, _ = DPrintf("leader update commit index to %d", newCommitIndex)
 		rf.commitIndex = newCommitIndex
+		if rf.commitIndex == rf.GetLastIndex() {
+			if rf.new {
+				rf.new = false
+			}
+		}
 		rf.chCommit <- struct{}{}
 	}
 
@@ -483,10 +485,10 @@ func (rf *Raft) broadCastAppendEntries() {
 					LeaderCommit: rf.commitIndex,
 				}
 				p := peer
-				go func(index int, args AppendEntriesArgs) {
+				go func(p int, args AppendEntriesArgs) {
 					var reply AppendEntriesReply
 					_, _ = DPrintf("leader: send %v to node %d", args, p)
-					rf.sendAppendEntries(index, args, &reply)
+					rf.sendAppendEntries(p, args, &reply)
 				}(p, args)
 			}
 		}
@@ -514,12 +516,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := rf.currentTerm
 	isLeader := rf.state == StateLeader
-	if isLeader {
-		index = rf.log[len(rf.log)-1].LogIndex + 1
-		_, _ = DPrintf("leader get: %v", Entry{LogTerm: term, LogIndex: index, LogCommand: command})
+	if isLeader && !rf.new {
+		index = rf.GetLastIndex() + 1
+		_, _ = DPrintf("leader %d get: %v", rf.me, Entry{LogTerm: term, LogIndex: index, LogCommand: command})
 		rf.log = append(rf.log, Entry{LogTerm: term, LogIndex: index, LogCommand: command}) // 更新新的log到易失性的存储中
 		rf.persist()                                                                        // 保存到非易失性的存储中
-
 	}
 
 	return index, term, isLeader
@@ -595,10 +596,12 @@ func (rf *Raft) ticker() {
 				_, _ = DPrintf("candidate %d get most votes", rf.me)
 				rf.nextIndex = make([]int, len(rf.peers))
 				rf.matchIndex = make([]int, len(rf.peers))
+				rf.log = append(rf.log, Entry{LogIndex: rf.GetLastIndex() + 1, LogTerm: rf.currentTerm})
 				for peer := range rf.peers {
 					rf.nextIndex[peer] = rf.GetLastIndex() + 1
 					rf.matchIndex[peer] = 0
 				}
+				rf.new = true
 				rf.mu.Unlock()
 			}
 		case StateLeader:
@@ -659,11 +662,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.chApply = applyCh
 
 	// initialize from state persisted before a crash
-	_, _ = DPrintf("node: %d initialize from state persisted before a crash", rf.me)
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	_, _ = DPrintf("node: %d start ticker goroutine to start elections", rf.me)
 	go rf.ticker()
 
 	// start goroutine to update commit index and apply index
