@@ -221,10 +221,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int  // 当前任期
-	Success bool // 当跟随者中的日志情况于leader保持一致时为true，多退少补
-	ConflictIndex int // -1代表冲突了
-	ConflictTerm int // -1代表冲突了
+	Term          int  // 当前任期
+	Success       bool // 当跟随者中的日志情况于leader保持一致时为true，多退少补
+	ConflictIndex int  // -1代表冲突了
+	ConflictTerm  int  // -1代表冲突了
 }
 
 //
