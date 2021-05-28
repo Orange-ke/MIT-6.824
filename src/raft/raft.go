@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"math/rand"
 
 	//	"bytes"
@@ -131,15 +133,15 @@ func (rf *Raft) GetLastTerm() int {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist() {
+func (rf *Raft) persist() { // 在修改了需要存储在非易失性存储上的状态后 需要立即调用
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	_ = e.Encode(rf.currentTerm)
+	_ = e.Encode(rf.votedFor)
+	_ = e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -149,19 +151,22 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	//Your code here (2C).
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var votedFor int
+	var log []Entry
+	if d.Decode(&term) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		_, _ = DPrintf("readPersist error")
+	} else {
+		rf.currentTerm = term
+		rf.votedFor = votedFor
+		rf.log = log
+		_, _ = DPrintf("readPersist: rf.currentTerm: %d, rf.votedFor: %d, rf.log: %v", term, votedFor, log)
+	}
 }
 
 //
@@ -218,6 +223,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 当前任期
 	Success bool // 当跟随者中的日志情况于leader保持一致时为true，多退少补
+	ConflictIndex int // -1代表冲突了
+	ConflictTerm int // -1代表冲突了
 }
 
 //
@@ -227,6 +234,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	reply.VoteGranted = false
 	if args.Term < rf.currentTerm { // 请求投票携带的任期 小于 接收者的当前任期，则直接返回当前任期通知其过期
 		reply.Term = rf.currentTerm
@@ -296,18 +304,30 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	_, _ = DPrintf("node: %d, args.PrevLogIndex: %d - rf.GetLastIndex(): %d", rf.me, args.PrevLogIndex, rf.GetLastIndex())
 	if args.PrevLogIndex > rf.GetLastIndex() {
 		// 节点在prevLogIndex处不含有日志记录
+		reply.ConflictIndex = len(rf.log)
 		return
 	}
-	rf.log = rf.log[:args.PrevLogIndex+1] // 当节点 index >= leader保存的index时，这行代码之后index会保持一致
-	_, _ = DPrintf("node: %d, args.PrevLogIndex: %d - rf.GetLastIndex(): %d", rf.me, args.PrevLogIndex, rf.GetLastIndex())
-	_, _ = DPrintf("node: %d, args.PreLogTerm: %d - rf.GetLastTerm(): %d", rf.me, args.PreLogTerm, rf.GetLastTerm())
-	if args.PreLogTerm != rf.GetLastTerm() { // 增加该代码，去掉index相同，term不同的log条目 ！！！
-		rf.log = rf.log[:len(rf.log)-1]
-		return // 这里需要return，让prevIndex - 1， 后面优化
+	baseIndex := rf.GetBaseIndex()
+	if args.PrevLogIndex >= baseIndex {
+		if rf.log[args.PrevLogIndex - baseIndex].LogTerm != args.PreLogTerm { // 节点在prevLogIndex处有对应的日志记录，但是term不一致
+			reply.ConflictTerm = rf.log[args.PrevLogIndex - baseIndex].LogTerm
+			for i := args.PrevLogIndex - 1; i >= baseIndex; i-- { // 找到节点对应该term不一致的第一个index位置
+				if rf.log[i-baseIndex].LogTerm != reply.ConflictTerm {
+					reply.ConflictIndex = i + 1
+					break
+				}
+			}
+			return
+		}
 	}
-	rf.log = append(rf.log, args.Entries...)
-	_, _ = DPrintf("node: %d, state: %d, log length: %d", rf.me, rf.state, len(rf.log))
-	reply.Success = true
+
+	if args.PrevLogIndex >= baseIndex {
+		rf.log = rf.log[:args.PrevLogIndex - baseIndex + 1]
+		rf.log = append(rf.log, args.Entries...)
+		_, _ = DPrintf("node: %d, state: %d, log length: %d", rf.me, rf.state, len(rf.log))
+		reply.Success = true
+	}
+
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = Min(args.LeaderCommit, rf.GetLastIndex())
 		rf.chCommit <- struct{}{}
@@ -362,6 +382,7 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 			rf.currentTerm = reply.Term
 			rf.state = StateFollower
 			rf.votedFor = -1
+			rf.persist()
 		}
 		// 候选人获取的选票
 		if reply.VoteGranted {
@@ -394,6 +415,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 			rf.currentTerm = reply.Term
 			rf.state = StateFollower
 			rf.votedFor = -1
+			rf.persist()
 			return ok
 		}
 		_, _ = DPrintf("leader: %d heart beat get reply term: %d, self term %d", rf.me, reply.Term, rf.currentTerm)
@@ -405,7 +427,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 				_, _ = DPrintf("leader next index: %v, match index: %v", rf.nextIndex, rf.matchIndex)
 			}
 		} else {
-			rf.nextIndex[server] = rf.nextIndex[server] - 1 // 否则将下标减一重试
+			rf.nextIndex[server] = reply.ConflictIndex // 否则将下标减一重试
 			_, _ = DPrintf("leader next index: %v", rf.nextIndex)
 		}
 		return ok
@@ -518,7 +540,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := rf.state == StateLeader
 	if isLeader && !rf.new {
 		index = rf.GetLastIndex() + 1
-		_, _ = DPrintf("leader %d get: %v", rf.me, Entry{LogTerm: term, LogIndex: index, LogCommand: command})
+		_, _ = DPrintf("leader %d get: %v =============", rf.me, Entry{LogTerm: term, LogIndex: index, LogCommand: command})
 		rf.log = append(rf.log, Entry{LogTerm: term, LogIndex: index, LogCommand: command}) // 更新新的log到易失性的存储中
 		rf.persist()                                                                        // 保存到非易失性的存储中
 	}
@@ -578,6 +600,7 @@ func (rf *Raft) ticker() {
 			rf.currentTerm++
 			rf.votedFor = rf.me
 			rf.voteCount = 1
+			rf.persist()
 			rf.mu.Unlock()
 			go rf.broadCastRequestVote()
 			select {
