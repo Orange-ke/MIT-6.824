@@ -89,6 +89,7 @@ type Raft struct {
 	nextIndex  []int // 保存需要发送给每个节点的下一条日志条目的索引号，初始化为leader的最后一条日志索引 + 1
 	matchIndex []int // 保存所有节点已知的已被复制的最高日志索引号
 
+	//
 	state             int
 	voteCount         int
 	chHeartBeat       chan struct{}
