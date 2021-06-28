@@ -24,6 +24,8 @@ type RequestVoteReply struct {
 
 //
 // example RequestVote RPC handler.
+// 在成员变动时，leader可以记录一个上一次选举成功的时间点，然后每隔150ms更新一次这个时间，当在这个时间之后的150ms内收到竞选消息，就忽略
+// follower则时在收到心跳信号后更新一下时间点，当在这个时间之后的150ms内收到竞选消息，就忽略
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).

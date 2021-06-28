@@ -1,5 +1,7 @@
 package raft
 
+import "time"
+
 type AppendEntriesArgs struct {
 	Term         int     // 领导者的任期号
 	LeaderId     int     // 领导者在peers中的下标
@@ -113,38 +115,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 func (rf *Raft) broadCastAppendEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// 发送下一次append entries时，先判断一下leader自己有没有需要提交的log项
-	// 判断逻辑为：
-	// 1. 从上一次的commit index + 1 到 last index为止，那些log是大多数node已经复制了的
-	// 2. 找到已经可以commit的日志则通知进行commit
-	// 3. 只要对应的index已经认为可以committed，其之前的index也间接的认为是committed
-	// 4. 通过apply，从记录的applied 到 committed index 都会应用对应的command
-	newCommitIndex := rf.commitIndex
-	lastIndex := rf.GetLastIndex()
 	baseIndex := rf.GetBaseIndex()
-	for i := rf.commitIndex + 1; i <= lastIndex; i++ {
-		count := 1
-		for peer := range rf.peers {
-			if peer != rf.me && rf.matchIndex[peer] >= i && rf.log[i-baseIndex].LogTerm == rf.currentTerm {
-				// rf.log[i - baseIndex].LogTerm == rf.currentTerm 表示leader不会覆盖已有的日志
-				count++
-			}
-		}
-		if count > len(rf.peers)/2 {
-			newCommitIndex = i
-		}
-	}
-	if newCommitIndex != rf.commitIndex {
-		_, _ = DPrintf("leader update commit index to %d", newCommitIndex)
-		rf.commitIndex = newCommitIndex
-		//if rf.commitIndex == rf.GetLastIndex() {
-		//	if rf.new {
-		//		rf.new = false
-		//	}
-		//}
-		rf.chCommit <- struct{}{}
-	}
-
 	for peer := range rf.peers {
 		if peer != rf.me && rf.state == StateLeader {
 			_, _ = DPrintf("leader %d send heart beat to node %d", rf.me, peer)
@@ -179,5 +150,44 @@ func (rf *Raft) broadCastAppendEntries() {
 				}(p, args)
 			}
 		}
+	}
+}
+
+func (rf *Raft) checkCommit() {
+	for {
+		rf.mu.Lock()
+		// 发送下一次append entries时，先判断一下leader自己有没有需要提交的log项
+		// 判断逻辑为：
+		// 1. 从上一次的commit index + 1 到 last index为止，那些log是大多数node已经复制了的
+		// 2. 找到已经可以commit的日志则通知进行commit
+		// 3. 只要对应的index已经认为可以committed，其之前的index也间接的认为是committed
+		// 4. 通过apply，从记录的applied 到 committed index 都会应用对应的command
+		newCommitIndex := rf.commitIndex
+		lastIndex := rf.GetLastIndex()
+		baseIndex := rf.GetBaseIndex()
+		for i := rf.commitIndex + 1; i <= lastIndex; i++ {
+			count := 1
+			for peer := range rf.peers {
+				if peer != rf.me && rf.matchIndex[peer] >= i && rf.log[i-baseIndex].LogTerm == rf.currentTerm {
+					// rf.log[i - baseIndex].LogTerm == rf.currentTerm 表示leader不会覆盖已有的日志
+					count++
+				}
+			}
+			if count > len(rf.peers)/2 {
+				newCommitIndex = i
+			}
+		}
+		if newCommitIndex != rf.commitIndex {
+			_, _ = DPrintf("leader update commit index to %d", newCommitIndex)
+			rf.commitIndex = newCommitIndex
+			//if rf.commitIndex == rf.GetLastIndex() {
+			//	if rf.new {
+			//		rf.new = false
+			//	}
+			//}
+			rf.chCommit <- struct{}{}
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Millisecond * 10)
 	}
 }

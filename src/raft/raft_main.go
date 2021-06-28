@@ -107,6 +107,10 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isLeader
 }
 
+func (rf *Raft) GetPersistSize() int {
+	return rf.persister.RaftStateSize()
+}
+
 func (rf *Raft) GetLastIndex() int {
 	return rf.log[len(rf.log)-1].LogIndex
 }
@@ -233,7 +237,7 @@ func (rf *Raft) ticker() {
 			select {
 			case <-rf.chHeartBeat:
 			case <-rf.chVoteGrant:
-			case <-time.After(time.Duration(rand.Intn(500)+500) * time.Millisecond):
+			case <-time.After(time.Duration(rand.Intn(300)+300) * time.Millisecond):
 				rf.mu.Lock()
 				rf.state = StateCandidate
 				rf.mu.Unlock()
@@ -251,7 +255,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 			go rf.broadCastRequestVote()
 			select {
-			case <-time.After(time.Duration(rand.Intn(500)+500) * time.Millisecond):
+			case <-time.After(time.Duration(rand.Intn(300)+300) * time.Millisecond):
 				rf.mu.Lock()
 				_, _ = DPrintf("candidate %d this term fail to win, init next term", rf.me)
 				rf.mu.Unlock()
@@ -272,13 +276,14 @@ func (rf *Raft) ticker() {
 					rf.matchIndex[peer] = 0
 				}
 				//rf.new = true
+				go rf.checkCommit()
 				rf.mu.Unlock()
 			}
 		case StateLeader:
 			// 领导者：重复间隔发送心跳信道到其他节点(不产生分区的情况下，只可能选出一个领导)
 			_, _ = DPrintf("leader %d send heart beat normally", rf.me)
 			rf.broadCastAppendEntries()
-			time.Sleep(time.Duration(100) * time.Millisecond)
+			time.Sleep(time.Duration(30) * time.Millisecond)
 		}
 	}
 }
@@ -303,7 +308,7 @@ func (rf *Raft) updateEntries() {
 				_, _ = DPrintf("node %d send apply msg %v", rf.me, msg)
 			}
 		default:
-			time.Sleep(time.Millisecond * 10)
+			time.Sleep(time.Millisecond * 15)
 		}
 	}
 }
