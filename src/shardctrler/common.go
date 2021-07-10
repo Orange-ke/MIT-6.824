@@ -28,46 +28,64 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (cf *Config) Copy() Config {
+	config := Config{
+		Num: cf.Num,
+		Shards: cf.Shards,
+		Groups: make(map[int][]string),
+	}
+	for k, v := range cf.Groups {
+		config.Groups[k] = append([]string{}, v...)
+	}
+	return config
+}
+
 const (
 	OK = "OK"
+	WrongLeader = "WrongLeader"
 )
 
 type Err string
 
+type CkReq struct {
+	CkId int64
+	ReqId int
+}
+
 type JoinArgs struct {
+	CkReq
 	Servers map[int][]string // new GID -> servers mappings
 }
 
 type JoinReply struct {
-	WrongLeader bool
 	Err         Err
 }
 
 type LeaveArgs struct {
+	CkReq
 	GIDs []int
 }
 
 type LeaveReply struct {
-	WrongLeader bool
 	Err         Err
 }
 
 type MoveArgs struct {
+	CkReq
 	Shard int
 	GID   int
 }
 
 type MoveReply struct {
-	WrongLeader bool
 	Err         Err
 }
 
 type QueryArgs struct {
+	CkReq
 	Num int // desired config number
 }
 
 type QueryReply struct {
-	WrongLeader bool
 	Err         Err
 	Config      Config
 }
